@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <ctime>
@@ -31,13 +32,15 @@
 #include <string_view>
 #include <vector>
 
+#include "gltrace.hpp"
+
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
 #include <pl/memory/Signature.hpp>
 
 #define LOG_TAG "RenderScale"
-#define RS_VERSION "0.1.0"
+#define RS_VERSION "0.2.0-diag"
 
 namespace {
 void logLine(int prio, const char* fmt, ...);
@@ -235,6 +238,8 @@ bool installHook() {
     return true;
 }
 
+void installGlTrace();
+
 // libminecraftpe.so ainda pode nao estar mapeada quando o mod carrega:
 // observamos o dlopen e instalamos o hook assim que ela aparecer.
 void* dlopenDetour(const char* filename, int flags) {
@@ -244,6 +249,7 @@ void* dlopenDetour(const char* filename, int flags) {
         g_inInstall = true;
         LOGI("libminecraftpe.so carregada; instalando hook");
         installHook();
+        installGlTrace();
         g_inInstall = false;
     }
     return handle;
@@ -263,6 +269,11 @@ void watchDlopen() {
     }
 }
 
+void installGlTrace() {
+    if (g_logPath.empty()) return;
+    gltrace::install(g_logPath.parent_path());
+}
+
 bool minecraftMapped() {
     void* h = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
     if (!h) return false;
@@ -278,6 +289,10 @@ void onToggle(std::string_view /*moduleId*/, bool enabled) {
 }
 
 void onConfigChanged(std::string_view /*moduleId*/, std::string_view key, std::string_view value) {
+    if (key == "capture") {  // qualquer mudanca do interruptor arma uma captura
+        gltrace::arm();
+        return;
+    }
     if (key != "scale") return;
     const std::string text(value);
     char* end = nullptr;
@@ -285,9 +300,16 @@ void onConfigChanged(std::string_view /*moduleId*/, std::string_view key, std::s
     if (end == text.c_str()) return;
     g_scale.store(clampScale(v));
     saveConfig();
-    LOGI("escala alterada para %.2f (update chamado %llu vezes ate agora)",
-         static_cast<double>(g_scale.load()),
-         static_cast<unsigned long long>(g_frames.load()));
+    static std::atomic<long long> lastLogMs{0};
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+    if (nowMs - lastLogMs.load() > 400) {  // o slider dispara dezenas de eventos por segundo
+        lastLogMs.store(nowMs);
+        LOGI("escala alterada para %.2f (update chamado %llu vezes ate agora)",
+             static_cast<double>(g_scale.load()),
+             static_cast<unsigned long long>(g_frames.load()));
+    }
 }
 
 void registerMenu() {
@@ -304,11 +326,15 @@ void registerMenu() {
         .hideInHudEditor(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfigChanged)
-        .config("scale", "Render Scale", pl::modmenu::ConfigType::SliderFloat, def, mn, mx, "");
+        .config("scale", "Render Scale", pl::modmenu::ConfigType::SliderFloat, def, mn, mx, "")
+        .config("capture", "Capturar frames GL (mude o interruptor)",
+                pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     if (!builder.registerModule()) LOGE("falha ao registrar o modulo no Mod Menu");
 }
 
 }  // namespace
+
+void rsLogRaw(int prio, const char* msg) { logLine(prio, "%s", msg); }
 
 // ------------------------------------------------------------------- mod ----
 class RenderScaleMod {
@@ -340,6 +366,7 @@ public:
         if (minecraftMapped()) {
             LOGI("enable: libminecraftpe.so ja mapeada");
             installHook();
+            installGlTrace();
         } else {
             LOGI("enable: libminecraftpe.so ainda nao mapeada; aguardando dlopen");
             watchDlopen();
