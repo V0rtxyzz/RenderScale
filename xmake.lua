@@ -18,11 +18,11 @@ add_requires("glm")
 add_requires("entt")
 add_requires("fmt")
 
-target("RenderScale")
+target("RenderScaleBedrock")
     set_kind("shared")
     set_languages("c++20")
     set_strip("all")
-    add_files("src/main.cpp")
+    add_files("src/*.cpp")
     add_includedirs("src")
     add_packages("preloader", "nlohmann_json", "glm", "entt", "fmt")
 
@@ -37,10 +37,10 @@ target("RenderScale")
         if not target:is_plat("android") then return end
         import("lib.detect.find_tool")
         local python = find_tool("python3") or find_tool("python")
-        assert(python, "Python 3 is required to package RenderScale.levipack")
+        assert(python, "Python 3 is required to package RenderScaleBedrock.levipack")
         os.vrunv(python.program, {
             path.join(os.projectdir(), "scripts", "package_levipack.py"),
             "--library", target:targetfile(),
-            "--output", path.join(target:targetdir(), "RenderScale.levipack")
+            "--output", path.join(target:targetdir(), "RenderScaleBedrock.levipack")
         })
     end)
