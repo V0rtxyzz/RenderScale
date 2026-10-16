@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -196,6 +198,7 @@ void* g_surf = nullptr;
 std::filesystem::path g_out;
 int g_seq = 0;
 bool g_installed = false;
+bool g_installedOk = false;  // driver GL carregado para o redirecionamento
 
 inline bool capturing() { return g_state.load(std::memory_order_relaxed) == 2; }
 
@@ -249,6 +252,155 @@ void recDraw(EvType type, int mode, int count) {
     g_ev.push_back(e);
 }
 
+
+// ---------------------------------------------------------------- redirect ---
+// O renderer GLES do jogo desenha tudo no framebuffer 0: 3D, depois um glClear so de
+// DEPTH|STENCIL (limite 3D/HUD, confirmado pelo gltrace), depois o HUD. Redirecionamos o 3D para
+// um framebuffer menor e fazemos o blit para a tela exatamente nesse limite.
+constexpr GLenum GL_DRAW_FRAMEBUFFER = 0x8CA9;
+constexpr GLenum GL_READ_FRAMEBUFFER = 0x8CA8;
+constexpr GLbitfield GL_COLOR_BUFFER_BIT = 0x4000;
+constexpr GLbitfield GL_DEPTH_BUFFER_BIT = 0x0100;
+
+struct Drv {
+    void (*genFb)(GLsizei, GLuint*) = nullptr;
+    void (*genTex)(GLsizei, GLuint*) = nullptr;
+    void (*genRb)(GLsizei, GLuint*) = nullptr;
+    void (*bindTex)(GLenum, GLuint) = nullptr;
+    void (*bindRb)(GLenum, GLuint) = nullptr;
+    void (*texImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*) = nullptr;
+    void (*texParami)(GLenum, GLenum, GLint) = nullptr;
+    void (*rbStorage)(GLenum, GLenum, GLsizei, GLsizei) = nullptr;
+    GLenum (*checkFb)(GLenum) = nullptr;
+    void (*blit)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) = nullptr;
+    void (*getIntegerv)(GLenum, GLint*) = nullptr;
+    void (*getBooleanv)(GLenum, unsigned char*) = nullptr;
+    unsigned char (*isEnabled)(GLenum) = nullptr;
+    void (*colorMask)(unsigned char, unsigned char, unsigned char, unsigned char) = nullptr;
+    GLenum (*getError)() = nullptr;
+    const unsigned char* (*getString)(GLenum) = nullptr;
+} g_drv;
+
+std::atomic<bool> g_rdOn{true};          // modulo ligado
+std::atomic<float> g_rdScale{0.75f};     // escala pedida
+bool g_rdBroken = false;                 // falhou: nao tenta mais
+bool g_rdChecked = false;                // contexto/MSAA verificados
+bool g_active = false;                   // 3D sendo desenhado no framebuffer menor
+bool g_worldFrame = false;               // o frame anterior teve limite 3D/HUD (tem mundo)
+bool g_sawColor = false, g_sawBoundary = false;
+GLuint g_fbo = 0, g_tex = 0, g_rb = 0;
+int g_sw = 0, g_sh = 0;                  // tamanho do alvo
+int g_W = 0, g_H = 0;                    // tamanho da superficie EGL
+std::chrono::steady_clock::time_point g_lastResize{};
+unsigned long long g_rdFrames = 0;
+int g_rdErrors = 0;
+using EglQuery = unsigned (*)(void*, void*, int, int*);
+EglQuery g_eglQuery = nullptr;
+
+// libGLESv2 do sistema, ou, se nao achar, qualquer simbolo ja visivel no processo.
+void* drvSym(const char* name) {
+    static void* lib = [] {
+        void* h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_NOLOAD);
+        return h ? h : dlopen("libGLESv2.so", RTLD_NOW);
+    }();
+    void* f = lib ? dlsym(lib, name) : nullptr;
+    return f ? f : dlsym(RTLD_DEFAULT, name);
+}
+
+bool loadDrv() {
+    auto L = [](auto& fn, const char* n) { fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(drvSym(n)); };
+    L(g_drv.genFb, "glGenFramebuffers");
+    L(g_drv.genTex, "glGenTextures");
+    L(g_drv.genRb, "glGenRenderbuffers");
+    L(g_drv.bindTex, "glBindTexture");
+    L(g_drv.bindRb, "glBindRenderbuffer");
+    L(g_drv.texImage2D, "glTexImage2D");
+    L(g_drv.texParami, "glTexParameteri");
+    L(g_drv.rbStorage, "glRenderbufferStorage");
+    L(g_drv.checkFb, "glCheckFramebufferStatus");
+    L(g_drv.blit, "glBlitFramebuffer");
+    L(g_drv.getIntegerv, "glGetIntegerv");
+    L(g_drv.getBooleanv, "glGetBooleanv");
+    L(g_drv.isEnabled, "glIsEnabled");
+    L(g_drv.colorMask, "glColorMask");
+    L(g_drv.getError, "glGetError");
+    L(g_drv.getString, "glGetString");
+    void* egl = dlopen("libEGL.so", RTLD_NOW | RTLD_NOLOAD);
+    g_eglQuery = egl ? reinterpret_cast<EglQuery>(dlsym(egl, "eglQuerySurface"))
+                     : reinterpret_cast<EglQuery>(dlsym(RTLD_DEFAULT, "eglQuerySurface"));
+    return g_drv.genFb && g_drv.genTex && g_drv.genRb && g_drv.bindTex && g_drv.bindRb &&
+           g_drv.texImage2D && g_drv.texParami && g_drv.rbStorage && g_drv.checkFb && g_drv.blit &&
+           g_drv.getIntegerv && g_drv.getBooleanv && g_drv.isEnabled && g_drv.colorMask &&
+           g_drv.getError && g_eglQuery;
+}
+
+void rdBreak(const char* why) {
+    g_rdBroken = true;
+    say(kError, "redirecionamento 3D DESATIVADO: %s", why);
+}
+
+// Mapeia um retangulo do espaco do jogo (WxH) para o espaco do alvo (SWxSH).
+void mapRect(int& x, int& y, int& w, int& h) {
+    if (g_W <= 0 || g_H <= 0 || g_sw <= 0 || g_sh <= 0) return;
+    auto mx = [](int v) { return static_cast<int>(std::lround(static_cast<double>(v) * g_sw / g_W)); };
+    auto my = [](int v) { return static_cast<int>(std::lround(static_cast<double>(v) * g_sh / g_H)); };
+    const int x0 = mx(x), y0 = my(y);
+    const int x1 = mx(x + w), y1 = my(y + h);
+    x = x0; y = y0;
+    w = std::max(0, x1 - x0);
+    h = std::max(0, y1 - y0);
+}
+
+// Cria/redimensiona o alvo. Restaura os bindings de textura/renderbuffer do jogo.
+bool ensureTarget(void (*bindFb)(GLenum, GLuint), void (*fbTex)(GLenum, GLenum, GLenum, GLuint, GLint),
+                  void (*fbRb)(GLenum, GLenum, GLenum, GLuint)) {
+    const float s = std::clamp(g_rdScale.load(), 0.30f, 1.0f);
+    const int sw = std::max(16, static_cast<int>(std::lround(g_W * s)));
+    const int sh = std::max(16, static_cast<int>(std::lround(g_H * s)));
+    const auto now = std::chrono::steady_clock::now();
+    if (g_fbo && sw == g_sw && sh == g_sh) return true;
+    if (g_fbo && now - g_lastResize < std::chrono::milliseconds(250)) return true;  // debounce do slider
+    GLint prevTex = 0, prevRb = 0;
+    g_drv.getIntegerv(0x8069 /*TEXTURE_BINDING_2D*/, &prevTex);
+    g_drv.getIntegerv(0x8CA7 /*RENDERBUFFER_BINDING*/, &prevRb);
+    const bool first = (g_fbo == 0);
+    if (first) {
+        g_drv.genFb(1, &g_fbo);
+        g_drv.genTex(1, &g_tex);
+        g_drv.genRb(1, &g_rb);
+    }
+    g_drv.bindTex(0x0DE1, g_tex);
+    g_drv.texImage2D(0x0DE1, 0, 0x1908 /*RGBA*/, sw, sh, 0, 0x1908, 0x1401 /*UNSIGNED_BYTE*/, nullptr);
+    g_drv.texParami(0x0DE1, 0x2801, 0x2601);  // MIN LINEAR
+    g_drv.texParami(0x0DE1, 0x2800, 0x2601);  // MAG LINEAR
+    g_drv.texParami(0x0DE1, 0x2802, 0x812F);  // WRAP_S CLAMP
+    g_drv.texParami(0x0DE1, 0x2803, 0x812F);  // WRAP_T CLAMP
+    g_drv.bindRb(0x8D41, g_rb);
+    g_drv.rbStorage(0x8D41, 0x88F0 /*DEPTH24_STENCIL8*/, sw, sh);
+    bindFb(GL_FRAMEBUFFER, g_fbo);
+    fbTex(GL_FRAMEBUFFER, 0x8CE0, 0x0DE1, g_tex, 0);
+    fbRb(GL_FRAMEBUFFER, 0x821A /*DEPTH_STENCIL_ATTACHMENT*/, 0x8D41, g_rb);
+    const GLenum st = g_drv.checkFb(GL_FRAMEBUFFER);
+    g_drv.bindTex(0x0DE1, static_cast<GLuint>(prevTex));
+    g_drv.bindRb(0x8D41, static_cast<GLuint>(prevRb));
+    if (st != 0x8CD5 /*COMPLETE*/) {
+        bindFb(GL_FRAMEBUFFER, 0);
+        say(kError, "framebuffer do 3D incompleto (0x%X) em %dx%d", st, sw, sh);
+        return false;
+    }
+    g_sw = sw;
+    g_sh = sh;
+    g_lastResize = now;
+    say(kInfo, "alvo do 3D: %dx%d para tela %dx%d (escala %.2f)", sw, sh, g_W, g_H,
+        static_cast<double>(s));
+    return true;
+}
+
+bool rdWanted() {
+    return g_rdOn.load(std::memory_order_relaxed) && !g_rdBroken &&
+           g_rdScale.load(std::memory_order_relaxed) < 0.995f;
+}
+
 // ---- originais
 void (*o_bindFb)(GLenum, GLuint) = nullptr;
 void (*o_viewport)(GLint, GLint, GLsizei, GLsizei) = nullptr;
@@ -262,22 +414,77 @@ void (*o_drawE)(GLenum, GLsizei, GLenum, const void*) = nullptr;
 void (*o_drawA)(GLenum, GLint, GLsizei) = nullptr;
 unsigned (*o_swap)(void*, void*) = nullptr;
 
+
+void beginRedirect() {
+    if (!g_rdChecked) {
+        g_rdChecked = true;
+        const char* ver = g_drv.getString ? reinterpret_cast<const char*>(g_drv.getString(0x1F02)) : nullptr;
+        GLint samples = 0;
+        g_drv.getIntegerv(0x80A9 /*SAMPLES*/, &samples);
+        say(kInfo, "GL_VERSION=%s | amostras do framebuffer 0=%d", ver ? ver : "?", samples);
+        if (ver && std::strstr(ver, "OpenGL ES 2")) return rdBreak("contexto OpenGL ES 2 (sem glBlitFramebuffer)");
+        if (samples > 0) return rdBreak("superficie com MSAA (blit invalido); precisa de caminho com shader");
+    }
+    if (g_W <= 0 || g_H <= 0) return;
+    if (!ensureTarget(o_bindFb, o_fbTex, o_fbRb)) return rdBreak("nao consegui criar o alvo");
+    o_bindFb(GL_FRAMEBUFFER, g_fbo);
+    o_viewport(0, 0, g_sw, g_sh);
+    o_scissor(0, 0, g_sw, g_sh);
+    g_active = true;
+    if (g_rdFrames == 0) say(kInfo, "redirecionamento do 3D ATIVO (primeiro frame)");
+}
+
+void endRedirect(const char* why) {
+    if (!g_active) return;
+    unsigned char cm[4] = {1, 1, 1, 1};
+    g_drv.getBooleanv(0x0C23 /*COLOR_WRITEMASK*/, cm);
+    const bool scissorWas = g_drv.isEnabled(0x0C11) != 0;
+    o_bindFb(GL_READ_FRAMEBUFFER, g_fbo);
+    o_bindFb(GL_DRAW_FRAMEBUFFER, 0);
+    o_disable(GL_SCISSOR_TEST);
+    g_drv.colorMask(1, 1, 1, 1);
+    g_drv.blit(0, 0, g_sw, g_sh, 0, 0, g_W, g_H, GL_COLOR_BUFFER_BIT, 0x2601 /*LINEAR*/);
+    if (scissorWas) o_enable(GL_SCISSOR_TEST);
+    g_drv.colorMask(cm[0], cm[1], cm[2], cm[3]);
+    o_bindFb(GL_FRAMEBUFFER, 0);
+    o_viewport(0, 0, g_W, g_H);
+    o_scissor(0, 0, g_W, g_H);
+    g_active = false;
+    ++g_rdFrames;
+    if (g_drv.getError() != 0 && ++g_rdErrors >= 3) rdBreak("erros GL repetidos no blit");
+    if (g_rdFrames == 1 || g_rdFrames % 1200 == 0)
+        say(kInfo, "redirecionamento: %llu frames (%s)", g_rdFrames, why);
+}
+
 // ---- detours
 void d_bindFb(GLenum t, GLuint fb) {
     if (t == GL_FRAMEBUFFER) g_fb.store(fb, std::memory_order_relaxed);
     if (capturing()) rec(E_BIND, static_cast<int>(t), static_cast<int>(fb));
+    if (g_active && fb == 0 && (t == GL_FRAMEBUFFER || t == GL_DRAW_FRAMEBUFFER || t == GL_READ_FRAMEBUFFER))
+        fb = g_fbo;  // o jogo pensa que desenha na tela; na verdade e o nosso alvo
     o_bindFb(t, fb);
 }
 void d_viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     if (capturing()) rec(E_VIEWPORT, x, y, w, h);
+    if (g_active && g_fb.load(std::memory_order_relaxed) == 0) mapRect(x, y, w, h);
     o_viewport(x, y, w, h);
 }
 void d_scissor(GLint x, GLint y, GLsizei w, GLsizei h) {
     if (capturing()) rec(E_SCISSOR, x, y, w, h);
+    if (g_active && g_fb.load(std::memory_order_relaxed) == 0) mapRect(x, y, w, h);
     o_scissor(x, y, w, h);
 }
 void d_clear(GLbitfield m) {
     if (capturing()) rec(E_CLEAR, static_cast<int>(m));
+    if (g_installedOk && rdWanted() && g_fb.load(std::memory_order_relaxed) == 0) {
+        if (m & GL_COLOR_BUFFER_BIT) {
+            g_sawColor = true;
+            if (!g_active && g_worldFrame) beginRedirect();  // inicio do frame com mundo
+        } else if ((m & GL_DEPTH_BUFFER_BIT) && g_sawColor) {
+            g_sawBoundary = true;                             // limite 3D / HUD
+            if (g_active) endRedirect("limite 3D/HUD");
+        }
+    }
     o_clear(m);
 }
 void d_enable(GLenum c) {
@@ -451,6 +658,16 @@ void dumpLocked() {
 unsigned d_swap(void* dpy, void* surf) {
     g_dpy = dpy;
     g_surf = surf;
+    if (g_active) endRedirect("fim do frame sem limite 3D/HUD");  // nunca deixa o frame preso no alvo
+    g_worldFrame = g_sawBoundary;
+    g_sawBoundary = false;
+    g_sawColor = false;
+    if (g_installedOk && g_eglQuery) {
+        int w = 0, h = 0;
+        g_eglQuery(dpy, surf, 0x3057, &w);
+        g_eglQuery(dpy, surf, 0x3056, &h);
+        if (w > 0 && h > 0) { g_W = w; g_H = h; }
+    }
     const int st = g_state.load(std::memory_order_relaxed);
     if (st == 1) {
         {
@@ -479,6 +696,12 @@ unsigned d_swap(void* dpy, void* surf) {
 namespace gltrace {
 
 bool installed() { return g_installed; }
+
+void setScale(float scale) {
+    if (!(scale == scale)) return;
+    g_rdScale.store(std::clamp(scale, 0.30f, 1.0f));
+}
+void setEnabled(bool on) { g_rdOn.store(on); }
 
 void arm() {
     if (!g_installed) {
@@ -521,6 +744,8 @@ bool install(const std::filesystem::path& outDir) {
         say(kError, "interceptacoes GL incompletas; captura indisponivel");
         return false;
     }
+    g_installedOk = loadDrv();
+    if (!g_installedOk) say(kError, "funcoes GL do driver ausentes; redirecionamento do 3D indisponivel");
     g_installed = true;
     return true;
 }

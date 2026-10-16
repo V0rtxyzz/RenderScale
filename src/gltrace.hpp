@@ -10,6 +10,11 @@ bool install(const std::filesystem::path& outDir);
 void arm();
 bool installed();
 
+// Escala so do 3D: o frame do jogo (antes do HUD) vai para um framebuffer menor e e esticado
+// de volta; o HUD continua em resolucao total.
+void setScale(float scale);   // 0.30 .. 1.00 (>= 0.995 desliga o redirecionamento)
+void setEnabled(bool on);
+
 // Substitui entradas da GOT de `module` (nome parcial, ex. "libminecraftpe.so").
 struct GotPatch {
     const char* name;

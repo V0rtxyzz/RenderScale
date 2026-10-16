@@ -40,7 +40,7 @@
 #include <pl/memory/Signature.hpp>
 
 #define LOG_TAG "RenderScale"
-#define RS_VERSION "0.2.0-diag"
+#define RS_VERSION "0.3.0-redirect"
 
 namespace {
 void logLine(int prio, const char* fmt, ...);
@@ -284,6 +284,7 @@ bool minecraftMapped() {
 // ------------------------------------------------------------------ menu ----
 void onToggle(std::string_view /*moduleId*/, bool enabled) {
     g_enabled.store(enabled);
+    gltrace::setEnabled(enabled);
     saveConfig();
     LOGI("modulo %s pelo menu", enabled ? "LIGADO" : "DESLIGADO");
 }
@@ -299,6 +300,7 @@ void onConfigChanged(std::string_view /*moduleId*/, std::string_view key, std::s
     const float v = std::strtof(text.c_str(), &end);
     if (end == text.c_str()) return;
     g_scale.store(clampScale(v));
+    gltrace::setScale(g_scale.load());
     saveConfig();
     static std::atomic<long long> lastLogMs{0};
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -320,8 +322,8 @@ void registerMenu() {
     std::snprintf(mx, sizeof(mx), "%.2f", static_cast<double>(kMaxScale));
 
     pl::modmenu::ModuleBuilder builder(kModuleId, "RenderScale");
-    builder.description("Escala a resolucao do 3D sem afetar a UI. Requer Upscaling ligado nos "
-                        "graficos (Vibrant Visuals).")
+    builder.description("Escala a resolucao so do 3D; o HUD fica nitido. Sem Vibrant Visuals usa um "
+                        "framebuffer menor; com Vibrant Visuals usa o upscaling do jogo.")
         .defaultEnabled(g_enabled.load())
         .hideInHudEditor(true)
         .onToggle(onToggle)
@@ -354,6 +356,8 @@ public:
             std::filesystem::remove(g_logPath, ec);
         }
         loadConfig();
+        gltrace::setScale(g_scale.load());
+        gltrace::setEnabled(g_enabled.load());
         LOGI("==== RenderScale %s carregado | escala=%.2f | modulo=%s ====", RS_VERSION,
              static_cast<double>(g_scale.load()), g_enabled.load() ? "ligado" : "desligado");
         LOGI("config: %s", g_configPath.c_str());
@@ -362,6 +366,7 @@ public:
 
     bool enable(pl::mod::ModContext&) {
         g_modEnabled.store(true);
+        gltrace::setEnabled(g_enabled.load());
         registerMenu();
         if (minecraftMapped()) {
             LOGI("enable: libminecraftpe.so ja mapeada");
@@ -376,6 +381,7 @@ public:
 
     bool disable(pl::mod::ModContext&) {
         g_modEnabled.store(false);  // o detour passa a ser transparente
+        gltrace::setEnabled(false);
         saveConfig();
         LOGI("mod desativado");
         return true;
@@ -383,6 +389,7 @@ public:
 
     bool unload(pl::mod::ModContext&) {
         g_modEnabled.store(false);
+        gltrace::setEnabled(false);
         saveConfig();
         return true;
     }
