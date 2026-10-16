@@ -1,4 +1,4 @@
-# RenderScale Bedrock (port + diagnóstico)
+# RenderScale Bedrock
 
 Mod nativo `.so` para o **LeviLauncher** que muda a resolução de renderização do 3D
 **sem afetar a UI**, inspirado no mod Java RenderScale. Slider de 30% a 100% no Mod Menu.
@@ -84,6 +84,30 @@ Como capturar:
 
 Formato: um evento por linha (`BIND`, `VIEWPORT`, `CLEAR`, `ENABLE/DISABLE`, `DRAW xN ...`) e um
 `## RESUMO` por frame (draws com depth ligado/desligado, framebuffers usados, viewports).
+
+## Versão 0.3.0: escala só do 3D, HUD nítido (sem Vibrant Visuals)
+
+O `gltrace` do renderer OpenGL ES mostrou que o jogo desenha tudo no framebuffer 0, nesta
+ordem: `glClear(COR|DEPTH|STENCIL)` -> 3D -> **`glClear(DEPTH|STENCIL)` sem cor** -> HUD. Esse
+clear sem cor é o limite 3D/HUD. O mod usa isso:
+
+1. No início do frame (1º clear com cor), o desenho vai para um framebuffer menor (`escala x tela`).
+   Os `glViewport`/`glScissor` do jogo são reescalados e o `glBindFramebuffer(0)` do jogo é
+   trocado pelo alvo. FBOs próprios do jogo (ex.: 1024x512) não são tocados.
+2. No clear de depth/stencil (limite), o alvo é esticado para a tela com `glBlitFramebuffer`
+   (filtro linear) e o desenho volta ao framebuffer 0 em resolução total.
+3. O HUD é desenhado em resolução total.
+
+Salvaguardas: se o frame termina sem limite (menus), o blit acontece antes do swap; só
+redireciona se o frame anterior teve limite (tem mundo); desativa-se sozinho se o contexto for ES2,
+se a superfície tiver MSAA, se o framebuffer ficar incompleto ou se houver erros GL repetidos.
+
+Para ver se funciona, procure no `renderscale.log`: `GL_VERSION=...`, `alvo do 3D: WxH`,
+`redirecionamento do 3D ATIVO` e `redirecionamento: N frames`. Se aparecer
+`redirecionamento 3D DESATIVADO: <motivo>`, me mande o log.
+
+Limitações conhecidas: não testado em aparelho; efeitos que leem o framebuffer durante o 3D
+(se houver) podem sair errados; o ganho de FPS depende de a GPU ser o gargalo.
 
 ## Créditos e licença
 
